@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2017-2019 Canonical, Ltd.
+ * Copyright (C) 2017-2020 Canonical, Ltd.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,6 +19,7 @@
 
 #include <multipass/exceptions/aborted_download_exception.h>
 #include <multipass/exceptions/download_exception.h>
+#include <multipass/exceptions/invalid_proxy_exception.h>
 #include <multipass/logging/log.h>
 
 #include <multipass/format.h>
@@ -29,6 +30,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkDiskCache>
 #include <QNetworkReply>
+#include <QTcpSocket>
 #include <QTimer>
 #include <QUrl>
 
@@ -106,6 +108,47 @@ QByteArray download(QNetworkAccessManager* manager, const Time& timeout, QUrl co
     }
     return reply->readAll();
 }
+
+QNetworkProxy discover_http_proxy()
+{
+    QNetworkProxy network_proxy;
+
+    QString http_proxy{qgetenv("http_proxy")};
+    if (http_proxy.isEmpty())
+    {
+        // Some OS's are case senstive
+        http_proxy = qgetenv("HTTP_PROXY");
+    }
+
+    if (!http_proxy.isEmpty())
+    {
+        if (!http_proxy.startsWith("http://"))
+        {
+            http_proxy.prepend("http://");
+        }
+
+        QUrl proxy_url{http_proxy};
+
+        network_proxy =
+            QNetworkProxy(QNetworkProxy::HttpCachingProxy, proxy_url.host(), static_cast<quint16>(proxy_url.port()),
+                          proxy_url.userName(), proxy_url.password());
+
+        // Detect if we can successfully use the proxy
+        QTcpSocket test_socket;
+        QObject::connect(&test_socket, QOverload<QAbstractSocket::SocketError>::of(&QAbstractSocket::error),
+                         [&test_socket](QTcpSocket::SocketError error) {
+                             fmt::print("Error: {}\n", error);
+                             throw mp::InvalidProxyException{test_socket.errorString().toStdString()};
+                         });
+
+        test_socket.connectToHost("multipass.run", 80);
+        test_socket.waitForConnected();
+
+        QNetworkProxy::setApplicationProxy(network_proxy);
+    }
+
+    return network_proxy;
+}
 } // namespace
 
 mp::URLDownloader::URLDownloader(std::chrono::milliseconds timeout) : URLDownloader{Path(), timeout}
@@ -115,11 +158,25 @@ mp::URLDownloader::URLDownloader(std::chrono::milliseconds timeout) : URLDownloa
 mp::URLDownloader::URLDownloader(const mp::Path& cache_dir, std::chrono::milliseconds timeout)
     : cache_dir_path{QDir(cache_dir).filePath("network-cache")}, timeout{timeout}
 {
+    // Instead of making multipassd bail if the proxy is not valid, capture the exception so
+    // the client can also display a meaningful message about why network operations are not
+    // working.
+    try
+    {
+        network_proxy = discover_http_proxy();
+    }
+    catch (const InvalidProxyException&)
+    {
+        invalid_proxy_exception = std::current_exception();
+    }
 }
 
 void mp::URLDownloader::download_to(const QUrl& url, const QString& file_name, int64_t size, const int download_type,
                                     const mp::ProgressMonitor& monitor)
 {
+    if (invalid_proxy_exception)
+        std::rethrow_exception(invalid_proxy_exception);
+
     auto manager{make_network_manager(cache_dir_path)};
 
     QFile file{file_name};
@@ -190,6 +247,9 @@ QByteArray mp::URLDownloader::download(const QUrl& url)
         }
     }
 
+    if (invalid_proxy_exception)
+        std::rethrow_exception(invalid_proxy_exception);
+
     // This will connect to the QNetworkReply::readReady signal and when emitted,
     // reset the timer.
     auto on_download = [this](QNetworkReply* reply, QTimer& download_timeout) {
@@ -225,6 +285,9 @@ QByteArray mp::URLDownloader::download(const QUrl& url)
 
 QDateTime mp::URLDownloader::last_modified(const QUrl& url)
 {
+    if (invalid_proxy_exception)
+        std::rethrow_exception(invalid_proxy_exception);
+
     auto manager{make_network_manager(cache_dir_path)};
 
     QEventLoop event_loop;

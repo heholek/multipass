@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2017-2019 Canonical, Ltd.
+ * Copyright (C) 2017-2020 Canonical, Ltd.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -24,6 +24,7 @@
 #include <multipass/exceptions/create_image_exception.h>
 #include <multipass/exceptions/exitless_sshprocess_exception.h>
 #include <multipass/exceptions/invalid_memory_size_exception.h>
+#include <multipass/exceptions/invalid_proxy_exception.h>
 #include <multipass/exceptions/sshfs_missing_error.h>
 #include <multipass/exceptions/start_exception.h>
 #include <multipass/logging/client_logger.h>
@@ -975,6 +976,14 @@ try // clang-format on
     }
     server->Write(response);
     status_promise->set_value(grpc::Status::OK);
+}
+catch (const mp::InvalidProxyException& e)
+{
+    status_promise->set_value(grpc::Status(
+        grpc::StatusCode::FAILED_PRECONDITION,
+        fmt::format("{}\nPlease fix the 'http_proxy' environment variable and restart the multipassd service.",
+                    e.what()),
+        ""));
 }
 catch (const std::exception& e)
 {
@@ -1962,6 +1971,12 @@ void mp::Daemon::create_vm(const CreateRequest* request, grpc::ServerWriter<Crea
                 config->factory->prepare_instance_image(vm_image, vm_desc);
 
                 return vm_desc;
+            }
+            catch (const mp::InvalidProxyException& e)
+            {
+                throw CreateImageException(fmt::format(
+                    "{}\nPlease fix the 'http_proxy' environment variable and restart the multipassd service.",
+                    e.what()));
             }
             catch (const std::exception& e)
             {
